@@ -1,6 +1,6 @@
 # dataset.py
 import dash
-from dash import html, dcc, Input, Output, State, ctx, no_update, dash_table
+from dash import html, dcc, Input, Output, State, ctx, no_update, dash_table, ALL
 import dash_bootstrap_components as dbc
 import requests
 import pandas as pd
@@ -16,32 +16,47 @@ app = dash.Dash(
 )
 server = app.server
 
-# ----------------- Helpers -----------------
+# ----------------- Helpers ----------------
 
-def df_to_table(df: pd.DataFrame, max_rows: int = 50):
-    """Convert DataFrame -> dash_table.DataTable with sorting, filtering, sticky headers"""
+
+def df_to_table_quicksight(df: pd.DataFrame, max_rows: int = 100):
+    """
+    Convert DataFrame -> Dash DataTable with QuickSight-style header and totals row at the bottom.
+    """
     if df is None or df.empty:
         return html.Div("No rows to display", className="text-muted")
 
-    display_df = df.head(max_rows)
+    display_df = df.head(max_rows).copy()
+
+    # Add Total Row at the bottom
+    totals = display_df.select_dtypes(include="number").sum()
+    totals_row = pd.DataFrame([totals], columns=display_df.columns)
+    
+    # For non-numeric columns, write 'Total'
+    for col in display_df.select_dtypes(exclude="number").columns:
+        totals_row[col] = "Total"
+
+    display_df = pd.concat([display_df, totals_row], ignore_index=True)
 
     return dash_table.DataTable(
         columns=[{"name": c, "id": c, "deletable": False, "selectable": True} for c in display_df.columns],
         data=display_df.to_dict("records"),
-        filter_action="native",
+        # filter_action="native",
         sort_action="native",
         sort_mode="multi",
         page_action="none",
-        style_table={"overflowX": "auto", "maxHeight": "400px", "overflowY": "auto"},
+        style_table={"overflowX": "auto", "maxHeight": "500px", "overflowY": "auto"},
         style_header={
-            "backgroundColor": "#f9f9f9",
+            "backgroundColor": "#670178",
+            "color": "white",
             "fontWeight": "bold",
+            "textAlign": "center",
             "position": "sticky",
             "top": 0,
             "zIndex": 1,
         },
         style_cell={
-            "textAlign": "left",
+            "textAlign": "center",
             "minWidth": "100px",
             "width": "150px",
             "maxWidth": "300px",
@@ -51,10 +66,18 @@ def df_to_table(df: pd.DataFrame, max_rows: int = 50):
             {
                 "if": {"row_index": "odd"},
                 "backgroundColor": "#f5f5f5",
-            }
+            },
+            {
+                # Last row = totals
+                "if": {"row_index": len(display_df)-1},
+                "backgroundColor": "#670178",
+                "color": "white",
+                "fontWeight": "bold",
+            },
         ],
         page_size=max_rows,
     )
+
 
 
 def safe_get(url, params=None, timeout=10):
@@ -128,15 +151,13 @@ app.layout = dbc.Container(
 
         # Stores
         dcc.Store(id="current-dataset-store", data={"dataset_id": None, "page": 1, "limit": 50, "latest_file": None, "dataset_name": None}),
-        # analysis-store: stores dataset_id and columns (no raw rows)
         dcc.Store(id="analysis-store", data={"dataset_id": None, "columns": []}),
-        # store last generated preview metadata
         dcc.Store(id="preview-result-store", data={"last_preview": None}),
 
         html.Div(id="preview-header"),
         html.Div(id="dataset-preview", className="mt-3"),
 
-        # Pagination controls (always present)
+        # Pagination controls
         dbc.Row(
             [
                 dbc.Col(dbc.Button("Prev", id="prev-page", color="primary"), width="auto"),
@@ -199,23 +220,27 @@ app.layout = dbc.Container(
                         ),
 
                         html.Hr(),
-                        html.H5("Analysis Builder (columns only)"),
+                        html.H5("Analysis Builder"),
 
-                        # Generate button
                         dbc.Button("Generate Table", id="generate-table-btn", color="primary", className="mb-2"),
 
-                        # Editor + preview area
+                        # Single scrollable container for editor + pivot output
                         html.Div(
-                            id="analysis-preview",
+                            id="analysis-editor-container",
                             style={
-                                "maxHeight": "420px",
-                                "overflow": "auto",
+                                "maxHeight": "500px",
+                                "overflowY": "auto",
                                 "border": "1px solid #e6e6e6",
                                 "padding": "12px",
                                 "borderRadius": "10px",
                                 "background": "#fafafa",
                                 "boxShadow": "0 2px 8px rgba(0,0,0,0.03)",
                             },
+                            children=[
+                                html.Div(id="analysis-preview"),
+                                html.Hr(style={"margin": "12px 0"}),
+                                html.Div(id="pivot-output")
+                            ]
                         ),
 
                         html.Div(id="analysis-msg", className="mt-2"),
@@ -239,6 +264,8 @@ app.layout = dbc.Container(
     ],
     fluid=True,
 )
+
+
 
 # ----------------- Load dataset list -----------------
 @app.callback(
@@ -335,7 +362,7 @@ def open_and_paginate(open_clicks, next_click, prev_click, go_click, new_limit, 
     df = pd.DataFrame(payload.get("data", []))
     df = df.replace({np.nan: None})
 
-    table = df_to_table(df)
+    table = df_to_table_quicksight(df)
     header = html.H4(f"Preview: {dataset_name} (Page {page} of {total_pages}) | File: {latest_file}")
 
     # fetch only columns for analysis-store from the backend columns API
@@ -354,61 +381,61 @@ def open_and_paginate(open_clicks, next_click, prev_click, go_click, new_limit, 
 # ----------------- Build pivot editor (helper) -----------------
 def build_pivot_editor_ui(cols, prefill=None):
     """
-    Pivot table editor (QuickSight-like):
-    - Rows, Columns, Values with Aggregations
-    - Dynamic addition/removal of value columns
+    cols: list of dataset columns
+    prefill: optional dict with keys: rows, columns, values (list of dicts with column+agg)
     """
     prefill = prefill or {}
     rows_val = prefill.get("rows", [])
     cols_val = prefill.get("columns", [])
-    vals_val = prefill.get("values", [])
+    values_val = prefill.get("values", [])
 
     options = [{"label": c, "value": c} for c in cols]
-    agg_options = [
-        {"label": "sum", "value": "sum"},
-        {"label": "mean", "value": "mean"},
-        {"label": "count", "value": "count"},
-        {"label": "max", "value": "max"},
-        {"label": "min", "value": "min"},
-    ]
 
-    # Build initial value rows
-    value_rows = []
-    for i, v in enumerate(vals_val):
-        col_val = v.get("column")
-        agg_val = v.get("agg", "sum")
-        value_rows.append(
-            dbc.Row(
-                [
-                    dbc.Col(html.B(f"{i+1}."), width=1, style={"textAlign": "right", "paddingTop": "7px"}),
-                    dbc.Col(dcc.Dropdown(options=options, value=col_val, id={"type": "value-field", "index": i}, clearable=False), width=5),
-                    dbc.Col(dcc.Dropdown(options=agg_options, value=agg_val, id={"type": "agg-select", "index": i}, clearable=False), width=4),
-                    dbc.Col(dbc.Button("Remove", id={"type": "remove-value-btn", "index": i}, color="danger", size="sm"), width=2)
-                ],
-                className="mb-2",
-                id={"type": "value-row", "index": i}
-            )
-        )
-
-    container = html.Div(value_rows, id="values-container")
-
+    # Rows + Columns
     editor_children = [
         dbc.Row(
             [
-                dbc.Col(dbc.Label("Rows (index)"), width=2),
-                dbc.Col(dcc.Dropdown(id="row-field", options=options, value=rows_val, multi=True), width=4),
+                dbc.Col(dbc.Label("Rows (Index)"), width=2),
+                dbc.Col(dcc.Dropdown(id={"type": "row-field", "index": 0}, options=options, value=rows_val, multi=True), width=4),
                 dbc.Col(dbc.Label("Columns"), width=2),
-                dbc.Col(dcc.Dropdown(id="col-field", options=options, value=cols_val, multi=True), width=4),
+                dbc.Col(dcc.Dropdown(id={"type": "col-field", "index": 0}, options=options, value=cols_val, multi=True), width=4),
             ],
-            className="mb-3",
+            className="mb-2",
         ),
-        html.H5("Values and Aggregations"),
-        container,
-        dbc.Button("➕ Add Value Column", id="add-value-btn", color="secondary", size="sm", className="mb-3"),
         html.Hr(),
-        html.Div(id="pivot-output", children=html.Div("Click 'Generate Table' to compute server-side preview.", className="text-muted")),
+        html.Div("Values & Aggregation", className="fw-bold mb-2"),
     ]
+
+    # Values + aggregation
+    for i, v in enumerate(values_val or [{"column": None, "agg": "sum"}]):
+        editor_children.append(
+            dbc.Row(
+                [
+                    dbc.Col(dcc.Dropdown(
+                        id={"type": "value-field", "index": i},
+                        options=options,
+                        value=v.get("column"),
+                        placeholder="Select Value Column"
+                    ), width=6),
+                    dbc.Col(dcc.Dropdown(
+                        id={"type": "agg-select", "index": i},
+                        options=[
+                            {"label": "sum", "value": "sum"},
+                            {"label": "mean", "value": "mean"},
+                            {"label": "count", "value": "count"},
+                            {"label": "max", "value": "max"},
+                            {"label": "min", "value": "min"},
+                        ],
+                        value=v.get("agg", "sum"),
+                        clearable=False
+                    ), width=3),
+                ],
+                className="mb-2",
+            )
+        )
+
     return editor_children
+
 
 
 
@@ -438,26 +465,26 @@ def modify_value_rows(add_click, remove_clicks, children, analysis_store):
     # Remove button clicked
     if isinstance(ctx_trigger, dict) and ctx_trigger.get("type") == "remove-value-btn":
         idx_to_remove = ctx_trigger["index"]
-        children = [child for child in children if child['props']['id']['index'] != idx_to_remove]
+        children = [child for child in children if child.id["index"] != idx_to_remove]
 
     # Add button clicked
     elif ctx_trigger == "add-value-btn":
-        new_index = max([child['props']['id']['index'] for child in children], default=-1) + 1
+        new_index = max([child.id["index"] for child in children], default=-1) + 1
         new_row = dbc.Row(
             [
-                dbc.Col(html.B(f"{new_index+1}."), width=1, style={"textAlign": "right", "paddingTop": "7px"}),
-                dbc.Col(dcc.Dropdown(options=options, id={"type": "value-field", "index": new_index}, clearable=False), width=5),
+                dbc.Col(html.B(f"{len(children)+1}."), width=1, style={"textAlign": "right", "paddingTop": "7px"}),
+                dbc.Col(dcc.Dropdown(options=options, id={"type": "value-field", "index": new_index}, clearable=False), width=6),
                 dbc.Col(dcc.Dropdown(options=agg_options, value="sum", id={"type": "agg-select", "index": new_index}, clearable=False), width=4),
-                dbc.Col(dbc.Button("Remove", id={"type": "remove-value-btn", "index": new_index}, color="danger", size="sm"), width=2)
+                dbc.Col(dbc.Button("Remove", id={"type": "remove-value-btn", "index": new_index}, color="danger", size="sm"), width=1)
             ],
             className="mb-2",
             id={"type": "value-row", "index": new_index}
         )
         children.append(new_row)
 
-    # Renumber rows
-    for i, child in enumerate(children):
-        child['props']['children'][0]['props']['children'] = f"{i+1}."
+    # Renumber rows properly
+    for idx, child in enumerate(children):
+        child.children[0].children = f"{idx+1}."
 
     return children
 
@@ -475,19 +502,20 @@ def modify_value_rows(add_click, remove_clicks, children, analysis_store):
     State("analysis-store", "data"),
     prevent_initial_call=True,
 )
-def open_analysis_modal_and_switch_editor(analysis_btns, analysis_type, saved_analysis_value, close_click, analysis_store):
+def open_analysis_modal_and_restore(analysis_btns, analysis_type, saved_analysis_value, close_click, analysis_store):
     triggered = ctx.triggered_id
     if not triggered:
         return no_update, no_update, no_update, no_update
 
-    # close button -> close modal
+    # Close modal
     if triggered == "close-analysis-btn":
         return False, no_update, no_update, no_update
 
-    # If Analysis button clicked -> open modal and load columns + saved analyses
+    # Analysis button clicked -> open modal
     if isinstance(triggered, dict) and triggered.get("type") == "analysis-btn":
         ds_id = triggered["dataset_id"]
-        # fetch columns for dataset
+
+        # Fetch dataset columns
         try:
             res = requests.get(f"{API_BASE}/datasets/{ds_id}/columns", timeout=6)
             res.raise_for_status()
@@ -495,28 +523,38 @@ def open_analysis_modal_and_switch_editor(analysis_btns, analysis_type, saved_an
         except Exception:
             cols = analysis_store.get("columns", []) if analysis_store else []
 
-        # fetch saved analyses list for the dataset
+        # Fetch all saved analyses for this dataset
         saved_opts = []
+        selected_analysis_id = None
+        last_config = None
         try:
-            res = requests.get(f"{API_BASE}/analyses/", params={"dataset_id": ds_id}, timeout=6)
+            res = requests.get(f"{API_BASE}/datasets/{ds_id}/analyses", timeout=6)
             res.raise_for_status()
             saved_list = res.json()
+
             saved_opts = [
                 {"label": f"{a.get('analysis_name')} ({a.get('analysis_type')})", "value": str(a.get("id"))}
                 for a in saved_list
             ]
+
+            if saved_list:
+                # Restore last saved analysis
+                last_analysis = saved_list[-1]  # or sort by created_at if you have timestamp
+                selected_analysis_id = str(last_analysis["id"])
+                last_config = last_analysis.get("config", {})
         except Exception:
             saved_opts = []
+            last_config = None
 
-        # default editor (no prefill)
+        # Build editor
         if analysis_type == "pivot":
-            preview = build_pivot_editor_ui(cols, prefill=None)
+            preview = build_pivot_editor_ui(cols, prefill=last_config)
         else:
             preview = [html.Div("Editor for other analysis types (not implemented).")]
 
-        return True, preview, saved_opts, None
+        return True, preview, saved_opts, selected_analysis_id
 
-    # If analysis-type changed -> rebuild editor using stored columns
+    # Analysis type changed -> rebuild editor using stored columns
     if triggered == "analysis-type":
         cols = analysis_store.get("columns", []) if analysis_store else []
         if analysis_type == "pivot":
@@ -524,7 +562,7 @@ def open_analysis_modal_and_switch_editor(analysis_btns, analysis_type, saved_an
         else:
             return no_update, [html.Div("Editor for other analysis types (not implemented).")], no_update, no_update
 
-    # If user selected a saved analysis -> fetch it and prefill builder
+    # User selected a saved analysis -> fetch it and prefill
     if triggered == "saved-analyses-select" or (isinstance(triggered, dict) and triggered.get("type") == "saved-analyses-select"):
         saved_id = saved_analysis_value
         cols = analysis_store.get("columns", []) if analysis_store else []
@@ -542,19 +580,21 @@ def open_analysis_modal_and_switch_editor(analysis_btns, analysis_type, saved_an
     # Fallback
     return no_update, no_update, no_update, no_update
 
+
 # ----------------- Generate Table (server-side preview) -----------------
 @app.callback(
     Output("pivot-output", "children"),
     Output("preview-result-store", "data"),
     Input("generate-table-btn", "n_clicks"),
     State("analysis-type", "value"),
-    State("row-field", "value"),
-    State("col-field", "value"),
-    State("values-container", "children"),
+    State({"type": "row-field", "index": ALL}, "value"),
+    State({"type": "col-field", "index": ALL}, "value"),
+    State({"type": "value-field", "index": ALL}, "value"),
+    State({"type": "agg-select", "index": ALL}, "value"),
     State("analysis-store", "data"),
     prevent_initial_call=True,
 )
-def generate_preview(n_clicks, analysis_type, rows, cols, value_rows, analysis_store):
+def generate_preview(n_clicks, analysis_type, row_vals, col_vals, value_cols, agg_vals, analysis_store):
     dataset_id = analysis_store.get("dataset_id") if analysis_store else None
     if not dataset_id:
         return html.Div("No dataset selected", className="text-danger"), no_update
@@ -562,26 +602,47 @@ def generate_preview(n_clicks, analysis_type, rows, cols, value_rows, analysis_s
     if analysis_type != "pivot":
         return html.Div("Preview not implemented for this analysis type", className="text-muted"), no_update
 
-    # Build values_config from dynamic value rows
-    values_config = []
-    for row in value_rows:
-        children = row['props']['children']
-        col_val = children[0]['props'].get('value')
-        agg_val = children[1]['props'].get('value') or "sum"
-        if col_val:
-            values_config.append({"column": col_val, "agg": agg_val})
+    # Flatten lists safely (handles multi=True dropdowns)
+    rows_flat = []
+    for r in row_vals:
+        if isinstance(r, list):
+            rows_flat.extend(r)
+        elif r:
+            rows_flat.append(r)
 
-    if not values_config:
-        return html.Div("Please select at least one value column.", className="text-warning"), no_update
+    cols_flat = []
+    for c in col_vals:
+        if isinstance(c, list):
+            cols_flat.extend(c)
+        elif c:
+            cols_flat.append(c)
+
+    values_flat = [v for v in value_cols if v] if value_cols else []
+    aggs_flat = [a for a in agg_vals if a] if agg_vals else ["sum"]*len(values_flat)
+
+    if not rows_flat and not cols_flat:
+        return html.Div("Please select at least one Row or Column", className="text-warning"), no_update
+
+    # Build values payload
+    values_payload = []
+    for i, col in enumerate(values_flat):
+        agg_func = aggs_flat[i] if i < len(aggs_flat) else "sum"
+        values_payload.append({"column": col, "agg": agg_func})
 
     payload = {
         "dataset_id": dataset_id,
         "type": "pivot",
-        "rows": rows or [],
-        "columns": cols or [],
-        "values": values_config
+        "rows": rows_flat,
+        "columns": cols_flat,
+        "values": values_payload
     }
 
+    print("Pivot request received:")
+    print("Rows:", rows_flat)
+    print("Columns:", cols_flat)
+    print("Values:", values_payload)
+
+    # Call FastAPI
     res_json, err = safe_post(f"{API_BASE}/analysis/preview", json=payload, timeout=30)
     if err:
         return html.Div(f"❌ Error generating preview: {err}", className="text-danger"), no_update
@@ -591,40 +652,68 @@ def generate_preview(n_clicks, analysis_type, rows, cols, value_rows, analysis_s
         return html.Div("No rows returned by preview", className="text-muted"), {"last_preview": None}
 
     df = pd.DataFrame(table)
-    return df_to_table(df), {"last_preview": {"rows": len(df), "type": "pivot"}}
+    return df_to_table_quicksight(df), {"last_preview": {"rows": len(df), "type": "pivot"}}
+
+
 
 # ----------------- Save Analysis (sends config to backend) -----------------
+
 @app.callback(
     Output("analysis-msg", "children"),
     Input("save-analysis-btn", "n_clicks"),
     State("analysis-name", "value"),
     State("analysis-type", "value"),
     State("analysis-store", "data"),
-    State("row-field", "value"),
-    State("col-field", "value"),
-    State("value-field", "value"),
-    State("agg-select", "value"),
+    State({"type": "row-field", "index": ALL}, "value"),
+    State({"type": "col-field", "index": ALL}, "value"),
+    State({"type": "value-field", "index": ALL}, "value"),
+    State({"type": "agg-select", "index": ALL}, "value"),
     prevent_initial_call=True,
 )
-def save_analysis(n_clicks, name, a_type, analysis_store, rows, cols, values, agg):
+def save_analysis(n_clicks, name, a_type, analysis_store, rows_list, cols_list, values_list, agg_list):
     if not analysis_store or not analysis_store.get("dataset_id"):
         return html.Div("No dataset selected", className="text-danger")
     if not name or not a_type:
         return html.Div("Please provide analysis name and type", className="text-warning")
 
+    # Flatten lists (each dropdown might be multi=True)
+    rows = []
+    for r in rows_list:
+        if isinstance(r, list):
+            rows.extend(r)
+        elif r:
+            rows.append(r)
+
+    cols = []
+    for c in cols_list:
+        if isinstance(c, list):
+            cols.extend(c)
+        elif c:
+            cols.append(c)
+
+    values = values_list or []
+    aggs = agg_list or ["sum"] * len(values)
+
     config = {}
     if a_type == "pivot":
-        config = {"rows": rows or [], "columns": cols or [], "values": values or [], "agg": agg or "sum"}
+        config = {"rows": rows, "columns": cols, "values": [{"column": v, "agg": a} for v, a in zip(values, aggs)]}
     else:
         config = {"note": "no config implemented for this type yet"}
 
-    payload = {"dataset_id": analysis_store["dataset_id"], "analysis_name": name, "analysis_type": a_type, "config": config}
+    payload = {
+        "dataset_id": analysis_store["dataset_id"],
+        "analysis_name": name,
+        "analysis_type": a_type,
+        "config": config
+    }
+
     try:
         res = requests.post(f"{API_BASE}/analyses/", json=payload, timeout=10)
         res.raise_for_status()
         return html.Div("✅ Analysis saved successfully!", className="text-success")
     except Exception as e:
         return html.Div(f"❌ Error saving analysis: {str(e)}", className="text-danger")
+
 
 # ----------------- Run server -----------------
 if __name__ == "__main__":

@@ -172,15 +172,14 @@ from fastapi import Body
 
 @app.post("/analysis/preview")
 def analysis_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
-
     dataset_id = payload.get("dataset_id")
-    analysis_type = payload.get("analysis_type")
+    analysis_type = payload.get("type")
 
     rows = payload.get("rows", [])
     columns = payload.get("columns", [])
-    # Expect "values" to be a list of dicts: [{"column": "sales", "agg": "sum"}, ...]
     values_config = payload.get("values", [])
 
+    # Fetch dataset metadata
     metadata = crud.get_dataset_by_id(db, dataset_id)
     if not metadata:
         raise HTTPException(404, "Dataset not found")
@@ -192,7 +191,7 @@ def analysis_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
     obj = s3.get_object(Bucket=bucket, Key=latest_file)
     raw = obj["Body"].read()
 
-    # read file
+    # Read file
     if latest_file.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(raw))
     elif latest_file.endswith((".xlsx", ".xls")):
@@ -202,42 +201,45 @@ def analysis_preview(payload: dict = Body(...), db: Session = Depends(get_db)):
     else:
         raise HTTPException(400, "Unsupported file format")
 
+    print("Pivot request received:")
+    print("Rows:", rows)
+    print("Columns:", columns)
+    print("Values:", values_config)
+    print("Dataset columns:", df.columns.tolist())
+
     if analysis_type == "pivot":
         if not values_config:
             raise HTTPException(400, "Please select at least one value column for pivot")
 
         agg_dict = {}
+        value_cols = []
         for v in values_config:
-            col_name = v.get("column")
+            col = v.get("column")
             agg_func = v.get("agg", "sum")
-            if col_name not in df.columns:
-                raise HTTPException(400, f"Column {col_name} not found in dataset")
-            if agg_func not in ["sum", "mean", "count", "max", "min"]:
-                agg_func = "sum"
-            agg_dict[col_name] = agg_func
+            if col not in df.columns:
+                raise HTTPException(400, f"Column '{col}' not found in dataset")
+            agg_dict[col] = agg_func
+            value_cols.append(col)
 
-        pivot = df.pivot_table(
-            index=rows,
-            columns=columns,
-            values=list(agg_dict.keys()),
-            aggfunc=agg_dict
-        ).reset_index()
+        try:
+            pivot = df.pivot_table(
+                index=rows,
+                columns=columns,
+                values=value_cols,
+                aggfunc=agg_dict
+            ).reset_index()
+        except Exception as e:
+            print("Pivot failed:", e)
+            raise HTTPException(400, f"Pivot failed: {e}")
 
-        # flatten multi-index columns if any
+        # Flatten multi-index columns
         if isinstance(pivot.columns, pd.MultiIndex):
             pivot.columns = [
                 '_'.join([str(i) for i in col if i != '']) for col in pivot.columns.values
             ]
+        else:
+            pivot.columns = [str(c) for c in pivot.columns]
 
         return {"table": pivot.to_dict(orient="records")}
-
-    # For bar chart
-    elif analysis_type == "bar":
-        x = payload.get("x")
-        y = payload.get("y")
-        if not x or not y:
-            raise HTTPException(400, "x and y required for bar chart")
-        bar_df = df[[x, y]].groupby(x).sum().reset_index()
-        return {"table": bar_df.to_dict(orient="records")}
 
     return {"table": []}
