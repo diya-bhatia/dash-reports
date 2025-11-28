@@ -1,6 +1,6 @@
 # dataset.py
 import dash
-from dash import html, dcc, Input, Output, State, ctx, no_update
+from dash import html, dcc, Input, Output, State, ctx, no_update, dash_table
 import dash_bootstrap_components as dbc
 import requests
 import pandas as pd
@@ -17,18 +17,45 @@ app = dash.Dash(
 server = app.server
 
 # ----------------- Helpers -----------------
+
 def df_to_table(df: pd.DataFrame, max_rows: int = 50):
-    """Convert DataFrame -> html.Table (limited rows for performance)."""
+    """Convert DataFrame -> dash_table.DataTable with sorting, filtering, sticky headers"""
     if df is None or df.empty:
         return html.Div("No rows to display", className="text-muted")
 
     display_df = df.head(max_rows)
-    header = [html.Thead(html.Tr([html.Th(col) for col in display_df.columns]))]
-    body_rows = []
-    for _, row in display_df.iterrows():
-        body_rows.append(html.Tr([html.Td("" if pd.isna(v) else str(v)) for v in row.tolist()]))
-    tbody = html.Tbody(body_rows)
-    return dbc.Table(header + [tbody], bordered=True, striped=True, hover=True, responsive=True, size="sm")
+
+    return dash_table.DataTable(
+        columns=[{"name": c, "id": c, "deletable": False, "selectable": True} for c in display_df.columns],
+        data=display_df.to_dict("records"),
+        filter_action="native",
+        sort_action="native",
+        sort_mode="multi",
+        page_action="none",
+        style_table={"overflowX": "auto", "maxHeight": "400px", "overflowY": "auto"},
+        style_header={
+            "backgroundColor": "#f9f9f9",
+            "fontWeight": "bold",
+            "position": "sticky",
+            "top": 0,
+            "zIndex": 1,
+        },
+        style_cell={
+            "textAlign": "left",
+            "minWidth": "100px",
+            "width": "150px",
+            "maxWidth": "300px",
+            "whiteSpace": "normal",
+        },
+        style_data_conditional=[
+            {
+                "if": {"row_index": "odd"},
+                "backgroundColor": "#f5f5f5",
+            }
+        ],
+        page_size=max_rows,
+    )
+
 
 def safe_get(url, params=None, timeout=10):
     try:
@@ -326,14 +353,44 @@ def open_and_paginate(open_clicks, next_click, prev_click, go_click, new_limit, 
 
 # ----------------- Build pivot editor (helper) -----------------
 def build_pivot_editor_ui(cols, prefill=None):
-    """Return editor children (rows/cols/values/agg). prefill is dict with keys rows, columns, values, agg."""
+    """
+    Pivot table editor (QuickSight-like):
+    - Rows, Columns, Values with Aggregations
+    - Dynamic addition/removal of value columns
+    """
     prefill = prefill or {}
     rows_val = prefill.get("rows", [])
     cols_val = prefill.get("columns", [])
     vals_val = prefill.get("values", [])
-    agg_val = prefill.get("agg", "sum")
 
     options = [{"label": c, "value": c} for c in cols]
+    agg_options = [
+        {"label": "sum", "value": "sum"},
+        {"label": "mean", "value": "mean"},
+        {"label": "count", "value": "count"},
+        {"label": "max", "value": "max"},
+        {"label": "min", "value": "min"},
+    ]
+
+    # Build initial value rows
+    value_rows = []
+    for i, v in enumerate(vals_val):
+        col_val = v.get("column")
+        agg_val = v.get("agg", "sum")
+        value_rows.append(
+            dbc.Row(
+                [
+                    dbc.Col(html.B(f"{i+1}."), width=1, style={"textAlign": "right", "paddingTop": "7px"}),
+                    dbc.Col(dcc.Dropdown(options=options, value=col_val, id={"type": "value-field", "index": i}, clearable=False), width=5),
+                    dbc.Col(dcc.Dropdown(options=agg_options, value=agg_val, id={"type": "agg-select", "index": i}, clearable=False), width=4),
+                    dbc.Col(dbc.Button("Remove", id={"type": "remove-value-btn", "index": i}, color="danger", size="sm"), width=2)
+                ],
+                className="mb-2",
+                id={"type": "value-row", "index": i}
+            )
+        )
+
+    container = html.Div(value_rows, id="values-container")
 
     editor_children = [
         dbc.Row(
@@ -343,35 +400,67 @@ def build_pivot_editor_ui(cols, prefill=None):
                 dbc.Col(dbc.Label("Columns"), width=2),
                 dbc.Col(dcc.Dropdown(id="col-field", options=options, value=cols_val, multi=True), width=4),
             ],
-            className="mb-2",
+            className="mb-3",
         ),
-        dbc.Row(
-            [
-                dbc.Col(dbc.Label("Values"), width=2),
-                dbc.Col(dcc.Dropdown(id="value-field", options=options, value=vals_val, multi=True), width=4),
-                dbc.Col(dbc.Label("Aggregation"), width=2),
-                dbc.Col(
-                    dcc.Dropdown(
-                        id="agg-select",
-                        options=[
-                            {"label": "sum", "value": "sum"},
-                            {"label": "mean", "value": "mean"},
-                            {"label": "count", "value": "count"},
-                            {"label": "max", "value": "max"},
-                            {"label": "min", "value": "min"},
-                        ],
-                        value=agg_val,
-                        clearable=False,
-                    ),
-                    width=4,
-                ),
-            ],
-            className="mb-2",
-        ),
+        html.H5("Values and Aggregations"),
+        container,
+        dbc.Button("➕ Add Value Column", id="add-value-btn", color="secondary", size="sm", className="mb-3"),
         html.Hr(),
-        html.Div(id="pivot-output", children=html.Div("Click 'Generate Table' to compute server-side preview.", className="text-muted"))
+        html.Div(id="pivot-output", children=html.Div("Click 'Generate Table' to compute server-side preview.", className="text-muted")),
     ]
     return editor_children
+
+
+
+@app.callback(
+    Output("values-container", "children"),
+    Input("add-value-btn", "n_clicks"),
+    Input({"type": "remove-value-btn", "index": dash.ALL}, "n_clicks"),
+    State("values-container", "children"),
+    State("analysis-store", "data"),
+    prevent_initial_call=True
+)
+def modify_value_rows(add_click, remove_clicks, children, analysis_store):
+    ctx_trigger = ctx.triggered_id
+    cols = analysis_store.get("columns", []) if analysis_store else []
+    options = [{"label": c, "value": c} for c in cols]
+    agg_options = [
+        {"label": "sum", "value": "sum"},
+        {"label": "mean", "value": "mean"},
+        {"label": "count", "value": "count"},
+        {"label": "max", "value": "max"},
+        {"label": "min", "value": "min"},
+    ]
+
+    if children is None:
+        children = []
+
+    # Remove button clicked
+    if isinstance(ctx_trigger, dict) and ctx_trigger.get("type") == "remove-value-btn":
+        idx_to_remove = ctx_trigger["index"]
+        children = [child for child in children if child['props']['id']['index'] != idx_to_remove]
+
+    # Add button clicked
+    elif ctx_trigger == "add-value-btn":
+        new_index = max([child['props']['id']['index'] for child in children], default=-1) + 1
+        new_row = dbc.Row(
+            [
+                dbc.Col(html.B(f"{new_index+1}."), width=1, style={"textAlign": "right", "paddingTop": "7px"}),
+                dbc.Col(dcc.Dropdown(options=options, id={"type": "value-field", "index": new_index}, clearable=False), width=5),
+                dbc.Col(dcc.Dropdown(options=agg_options, value="sum", id={"type": "agg-select", "index": new_index}, clearable=False), width=4),
+                dbc.Col(dbc.Button("Remove", id={"type": "remove-value-btn", "index": new_index}, color="danger", size="sm"), width=2)
+            ],
+            className="mb-2",
+            id={"type": "value-row", "index": new_index}
+        )
+        children.append(new_row)
+
+    # Renumber rows
+    for i, child in enumerate(children):
+        child['props']['children'][0]['props']['children'] = f"{i+1}."
+
+    return children
+
 
 # ----------------- Unified Analysis Modal callback -----------------
 @app.callback(
@@ -461,16 +550,11 @@ def open_analysis_modal_and_switch_editor(analysis_btns, analysis_type, saved_an
     State("analysis-type", "value"),
     State("row-field", "value"),
     State("col-field", "value"),
-    State("value-field", "value"),
-    State("agg-select", "value"),
+    State("values-container", "children"),
     State("analysis-store", "data"),
     prevent_initial_call=True,
 )
-def generate_preview(n_clicks, analysis_type, rows, cols, values, agg, analysis_store):
-    triggered = ctx.triggered_id
-    if not triggered:
-        return no_update, no_update
-
+def generate_preview(n_clicks, analysis_type, rows, cols, value_rows, analysis_store):
     dataset_id = analysis_store.get("dataset_id") if analysis_store else None
     if not dataset_id:
         return html.Div("No dataset selected", className="text-danger"), no_update
@@ -478,16 +562,26 @@ def generate_preview(n_clicks, analysis_type, rows, cols, values, agg, analysis_
     if analysis_type != "pivot":
         return html.Div("Preview not implemented for this analysis type", className="text-muted"), no_update
 
+    # Build values_config from dynamic value rows
+    values_config = []
+    for row in value_rows:
+        children = row['props']['children']
+        col_val = children[0]['props'].get('value')
+        agg_val = children[1]['props'].get('value') or "sum"
+        if col_val:
+            values_config.append({"column": col_val, "agg": agg_val})
+
+    if not values_config:
+        return html.Div("Please select at least one value column.", className="text-warning"), no_update
+
     payload = {
         "dataset_id": dataset_id,
         "type": "pivot",
         "rows": rows or [],
         "columns": cols or [],
-        "values": values or [],
-        "agg": agg or "sum"
+        "values": values_config
     }
 
-    # Call server-side preview API
     res_json, err = safe_post(f"{API_BASE}/analysis/preview", json=payload, timeout=30)
     if err:
         return html.Div(f"❌ Error generating preview: {err}", className="text-danger"), no_update
