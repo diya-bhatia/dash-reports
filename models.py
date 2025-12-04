@@ -26,3 +26,27 @@ class Analysis(Base):
     config = Column(JSON, default={})
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CalculatedField(Base):
+    __tablename__ = "calculated_fields"
+
+    id = Column(Integer, primary_key=True, index=True)
+    analysis_id = Column(Integer, ForeignKey("analyses.id"), nullable=False)
+    dataset_id = Column(Integer, ForeignKey("dataset_metadata.id"), nullable=False)
+    field_name = Column(String, nullable=False)
+    formula = Column(String, nullable=False)
+    default_agg = Column(String, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class FilterSelection(Base):
+    __tablename__ = "filters"
+
+    id = Column(Integer, primary_key=True, index=True)
+    dataset_id = Column(String, index=True, nullable=False)
+    analysis_id = Column(Integer, index=True, nullable=False)
+    selected_columns = Column(JSON, nullable=False)  # stores list of column names
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+

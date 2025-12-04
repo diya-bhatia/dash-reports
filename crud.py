@@ -1,11 +1,13 @@
+from http.client import HTTPException
 import boto3
 import pandas as pd
 from io import BytesIO
 from sqlalchemy.orm import Session
-from models import DatasetMetadata , Analysis
-from schemas import DatasetMetadataCreate , AnalysisCreate
+from models import DatasetMetadata , Analysis ,CalculatedField , FilterSelection
+from schemas import DatasetMetadataCreate , AnalysisCreate ,CalculatedFieldCreate
 import os
 from dotenv import load_dotenv
+from typing import List
 
 load_dotenv()
 
@@ -82,3 +84,68 @@ def update_analysis_config(db: Session, analysis_id: int, config: dict):
         db.commit()
         db.refresh(analysis)
     return analysis
+
+
+def create_calculated_field(db: Session, payload: CalculatedFieldCreate):
+    # Fetch analysis → get dataset id
+    analysis = db.query(Analysis).filter(Analysis.id == payload.analysis_id).first()
+    if not analysis:
+        raise HTTPException(404, "Analysis not found")
+
+    calc = CalculatedField(
+        analysis_id = payload.analysis_id,
+        dataset_id = analysis.dataset_id,  # auto filling
+        field_name = payload.field_name,
+        formula = payload.formula,
+        default_agg = payload.default_agg
+    )
+
+    db.add(calc)
+    db.commit()
+    db.refresh(calc)
+    return calc
+
+
+def get_calculated_fields_by_analysis(db: Session, analysis_id: int):
+    return db.query(CalculatedField).filter(
+        CalculatedField.analysis_id == analysis_id
+    ).all()
+
+
+def delete_calculated_field(db: Session, field_id: int):
+    obj = db.query(CalculatedField).filter(CalculatedField.id == field_id).first()
+    if not obj:
+        return False
+    db.delete(obj)
+    db.commit()
+    return True
+
+
+def save_filter(db: Session, dataset_id: str, analysis_id: int, selected_columns: List[str]):
+    # Check if record already exists
+    existing = db.query(FilterSelection).filter_by(
+        dataset_id=dataset_id,
+        analysis_id=analysis_id
+    ).first()
+
+    if existing:
+        existing.selected_columns = selected_columns
+    else:
+        new_entry = FilterSelection(
+            dataset_id=dataset_id,
+            analysis_id=analysis_id,
+            selected_columns=selected_columns
+        )
+        db.add(new_entry)
+
+    db.commit()
+    return {"message": "Filters saved successfully"}
+
+
+def get_saved_filter(db: Session, dataset_id: str, analysis_id: int):
+    record = db.query(FilterSelection).filter_by(
+        dataset_id=dataset_id,
+        analysis_id=analysis_id
+    ).first()
+
+    return record.selected_columns if record else []
