@@ -206,6 +206,7 @@ def create_analysis(analysis: schemas.AnalysisCreate, db: Session = Depends(get_
     return crud.create_analysis(db, analysis)
 
 
+
 @app.post("/analysis/preview")
 def analysis_preview(payload: schemas.AnalysisPreviewRequest, db: Session = Depends(get_db)):
 
@@ -219,7 +220,6 @@ def analysis_preview(payload: schemas.AnalysisPreviewRequest, db: Session = Depe
 
     if not dataset_id:
         raise HTTPException(400, "dataset_id is required")
-
     if not analysis_id:
         raise HTTPException(400, "analysis_id is required")
 
@@ -252,11 +252,23 @@ def analysis_preview(payload: schemas.AnalysisPreviewRequest, db: Session = Depe
         except Exception as e:
             raise HTTPException(400, f"Formula Error in {field.field_name}: {e}")
 
+    # ---------------- APPLY SAVED FILTERS ----------------
+    saved_filters = crud.get_saved_filter(db, dataset_id, analysis_id)  # returns a list of columns
+    filtered_columns = []
+
+    if saved_filters:
+        for col in saved_filters:
+            if col in df.columns:
+                # If you only have column selection (no specific values), just keep the column
+                filtered_columns.append(col)
+
+        # Keep only selected columns + any columns needed for pivot
+        df = df[rows + columns + filtered_columns + [c for c in df.columns if c not in rows + columns + filtered_columns]]
+
     # ===========================================================
     #                          PIVOT
     # ===========================================================
     if analysis_type == "pivot":
-
         if not values_config:
             values_config = []  # initialize list if user didn't send values
 
@@ -275,8 +287,8 @@ def analysis_preview(payload: schemas.AnalysisPreviewRequest, db: Session = Depe
                 df,
                 index=rows,
                 columns=columns,
-                values=value_cols,
-                aggfunc=agg_dict,
+                values=value_cols if value_cols else None,
+                aggfunc=agg_dict if agg_dict else "sum",
                 margins=True,
                 margins_name="Total"
             )
@@ -302,10 +314,12 @@ def analysis_preview(payload: schemas.AnalysisPreviewRequest, db: Session = Depe
             "count": len(pivot),
             "table": pivot.to_dict(orient="records"),
             "calculated_fields_used": [f.field_name for f in calc_fields],
-            # "calculated_field_output_preview": df[[f.field_name for f in calc_fields]].head(10).to_dict(orient="records")
+            "filtered_columns": filtered_columns
         }
 
     return {"message": "Other analysis types coming soon"}
+
+
 
 
 
@@ -387,4 +401,24 @@ def get_saved_filter(dataset_id: str, analysis_id: int, db: Session = Depends(ge
         raise HTTPException(404, detail="No saved filter found")
 
     return filter_obj
+
+
+@app.delete("/filters")
+def delete_filter(dataset_id: str, analysis_id: int, db: Session = Depends(get_db)):
+    """
+    Delete saved filters for a specific dataset and analysis.
+    """
+    # Check if filter exists
+    filter_record = db.query(crud.FilterSelection).filter_by(
+        dataset_id=dataset_id,
+        analysis_id=analysis_id
+    ).first()
+
+    if not filter_record:
+        raise HTTPException(status_code=404, detail="Filter not found")
+
+    db.delete(filter_record)
+    db.commit()
+
+    return {"message": f"Filters for dataset_id={dataset_id} and analysis_id={analysis_id} deleted successfully"}
 

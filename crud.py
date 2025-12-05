@@ -124,8 +124,8 @@ def delete_calculated_field(db: Session, field_id: int):
 def save_filter(db: Session, dataset_id: str, analysis_id: int, selected_columns: List[str]):
     # Check if record already exists
     existing = db.query(FilterSelection).filter_by(
-        dataset_id=dataset_id,
-        analysis_id=analysis_id
+        dataset_id=str(dataset_id),
+        analysis_id=int(analysis_id)
     ).first()
 
     if existing:
@@ -144,8 +144,8 @@ def save_filter(db: Session, dataset_id: str, analysis_id: int, selected_columns
 
 def get_saved_filter(db: Session, dataset_id: str, analysis_id: int):
     record = db.query(FilterSelection).filter_by(
-        dataset_id=dataset_id,
-        analysis_id=analysis_id
+        dataset_id=str(dataset_id),
+        analysis_id=int(analysis_id)
     ).first()
 
     return record.selected_columns if record else []
