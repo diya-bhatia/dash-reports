@@ -1,50 +1,45 @@
-from http.client import HTTPException
+# crud.py
 import boto3
 import pandas as pd
 from io import BytesIO
 from sqlalchemy.orm import Session
-from models import DatasetMetadata , Analysis ,CalculatedField , FilterSelection
-from schemas import DatasetMetadataCreate , AnalysisCreate ,CalculatedFieldCreate
+from typing import List, Any, Optional
 import os
 from dotenv import load_dotenv
-from typing import List
+from models import (DatasetMetadata, Analysis, CalculatedField, FilterSelection,
+                    Report, Sheet, SheetAnalysisMap)
 
 load_dotenv()
 
-s3 = boto3.client(
+s3_client = boto3.client(
     "s3",
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
     region_name=os.getenv("AWS_REGION")
 )
 
-# ---------------- Get latest file in a prefix ----------------
+# S3 helpers
 def get_latest_file_from_s3(bucket: str, prefix: str) -> str:
-    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
     if "Contents" not in resp:
         raise Exception("No files found in S3 prefix")
-
     latest_obj = max(resp["Contents"], key=lambda x: x["LastModified"])
     return latest_obj["Key"]
 
-# ---------------- Fetch dataset ----------------
 def fetch_dataset_from_s3(bucket: str, key: str) -> pd.DataFrame:
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    data = obj["Body"].read()
-
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    raw = obj["Body"].read()
     if key.endswith(".parquet"):
-        df = pd.read_parquet(BytesIO(data))
+        return pd.read_parquet(BytesIO(raw))
     elif key.endswith(".csv"):
-        df = pd.read_csv(BytesIO(data))
-    elif key.endswith(".xlsx") or key.endswith(".xls"):
-        df = pd.read_excel(BytesIO(data))
+        return pd.read_csv(BytesIO(raw))
+    elif key.endswith((".xlsx", ".xls")):
+        return pd.read_excel(BytesIO(raw))
     else:
         raise Exception(f"Unsupported file type: {key}")
 
-    return df
-
-# ---------------- CRUD DB operations ----------------
-def create_dataset_metadata(db: Session, data: DatasetMetadataCreate, latest_file: str):
+# Dataset metadata
+def create_dataset_metadata(db: Session, data, latest_file: str):
     db_item = DatasetMetadata(**data.dict(), latest_file=latest_file)
     db.add(db_item)
     db.commit()
@@ -54,12 +49,11 @@ def create_dataset_metadata(db: Session, data: DatasetMetadataCreate, latest_fil
 def get_all_datasets(db: Session):
     return db.query(DatasetMetadata).all()
 
-def get_dataset_by_id(db: Session, dataset_id: int):
+def get_dataset_by_id(db: Session, dataset_id: int) -> Optional[DatasetMetadata]:
     return db.query(DatasetMetadata).filter(DatasetMetadata.id == dataset_id).first()
 
-
-
-def create_analysis(db: Session, analysis: AnalysisCreate):
+# Analysis
+def create_analysis(db: Session, analysis):
     db_analysis = Analysis(
         dataset_id=analysis.dataset_id,
         analysis_name=analysis.analysis_name,
@@ -78,41 +72,34 @@ def get_analysis(db: Session, analysis_id: int):
     return db.query(Analysis).filter(Analysis.id == analysis_id).first()
 
 def update_analysis_config(db: Session, analysis_id: int, config: dict):
-    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    analysis = get_analysis(db, analysis_id)
     if analysis:
         analysis.config = config
         db.commit()
         db.refresh(analysis)
     return analysis
 
-
-def create_calculated_field(db: Session, payload: CalculatedFieldCreate):
-    # Fetch analysis → get dataset id
-    analysis = db.query(Analysis).filter(Analysis.id == payload.analysis_id).first()
+# Calculated fields
+def create_calculated_field(db: Session, payload):
+    analysis = get_analysis(db, payload.analysis_id)
     if not analysis:
-        raise HTTPException(404, "Analysis not found")
-
+        raise Exception("Analysis not found")
     calc = CalculatedField(
-        analysis_id = payload.analysis_id,
-        dataset_id = analysis.dataset_id,  # auto filling
-        field_name = payload.field_name,
-        formula = payload.formula,
-        default_agg = payload.default_agg
+        analysis_id=payload.analysis_id,
+        dataset_id=analysis.dataset_id,
+        field_name=payload.field_name,
+        formula=payload.formula,
+        default_agg=payload.default_agg
     )
-
     db.add(calc)
     db.commit()
     db.refresh(calc)
     return calc
 
+def get_calculated_fields_by_analysis(db: Session, analysis_id: int) -> List[CalculatedField]:
+    return db.query(CalculatedField).filter(CalculatedField.analysis_id == analysis_id).all()
 
-def get_calculated_fields_by_analysis(db: Session, analysis_id: int):
-    return db.query(CalculatedField).filter(
-        CalculatedField.analysis_id == analysis_id
-    ).all()
-
-
-def delete_calculated_field(db: Session, field_id: int):
+def delete_calculated_field(db: Session, field_id: int) -> bool:
     obj = db.query(CalculatedField).filter(CalculatedField.id == field_id).first()
     if not obj:
         return False
@@ -120,32 +107,93 @@ def delete_calculated_field(db: Session, field_id: int):
     db.commit()
     return True
 
-
-def save_filter(db: Session, dataset_id: str, analysis_id: int, selected_columns: List[str]):
-    # Check if record already exists
-    existing = db.query(FilterSelection).filter_by(
-        dataset_id=str(dataset_id),
-        analysis_id=int(analysis_id)
-    ).first()
-
+# Filters
+def save_filter(db: Session, dataset_id: int, analysis_id: int, selected_columns: Any):
+    existing = db.query(FilterSelection).filter_by(dataset_id=int(dataset_id), analysis_id=int(analysis_id)).first()
     if existing:
         existing.selected_columns = selected_columns
-    else:
-        new_entry = FilterSelection(
-            dataset_id=dataset_id,
-            analysis_id=analysis_id,
-            selected_columns=selected_columns
-        )
-        db.add(new_entry)
-
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+        return existing
+    new_entry = FilterSelection(
+        dataset_id=int(dataset_id),
+        analysis_id=int(analysis_id),
+        selected_columns=selected_columns
+    )
+    db.add(new_entry)
     db.commit()
-    return {"message": "Filters saved successfully"}
+    db.refresh(new_entry)
+    return new_entry
+
+def get_saved_filter(db: Session, dataset_id: int, analysis_id: int) -> Any:
+    rec = db.query(FilterSelection).filter_by(dataset_id=int(dataset_id), analysis_id=int(analysis_id)).first()
+    return rec.selected_columns if rec else None
+
+def delete_filter(db: Session, dataset_id: int, analysis_id: int) -> bool:
+    rec = db.query(FilterSelection).filter_by(dataset_id=int(dataset_id), analysis_id=int(analysis_id)).first()
+    if not rec:
+        return False
+    db.delete(rec)
+    db.commit()
+    return True
+
+# Reports & Sheets
+def create_report(db: Session, name: str):
+    r = Report(name=name)
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return r
+
+def create_sheet(db: Session, name: str, report_id: int):
+    s = Sheet(name=name, report_id=report_id)
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return s
+
+def add_analysis_to_sheet(db: Session, sheet_id: int, analysis_id: int):
+    mapping = SheetAnalysisMap(sheet_id=sheet_id, analysis_id=analysis_id)
+    db.add(mapping)
+    db.commit()
+    db.refresh(mapping)
+    return mapping
+
+def get_all_reports(db: Session):
+    return db.query(Report).all()
+def get_sheet(db: Session, sheet_id: int):
+    return db.query(Sheet).filter(Sheet.id == sheet_id).first()
+
+def get_report(db: Session, report_id: int):
+    return db.query(Report).filter(Report.id == report_id).first()
 
 
-def get_saved_filter(db: Session, dataset_id: str, analysis_id: int):
-    record = db.query(FilterSelection).filter_by(
-        dataset_id=str(dataset_id),
-        analysis_id=int(analysis_id)
-    ).first()
+# Delete Report
+def delete_report(db: Session, report_id: int):
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        return False
+    
+    # Delete related sheets, mappings & analyses mapped in sheets
+    for sheet in report.sheets:
+        db.query(SheetAnalysisMap).filter_by(sheet_id=sheet.id).delete()
+        db.query(Sheet).filter(Sheet.id == sheet.id).delete()
 
-    return record.selected_columns if record else []
+    db.delete(report)
+    db.commit()
+    return True
+
+
+# Delete Sheet
+def delete_sheet(db: Session, sheet_id: int):
+    sheet = db.query(Sheet).filter(Sheet.id == sheet_id).first()
+    if not sheet:
+        return False
+    
+    # Delete mappings under sheet
+    db.query(SheetAnalysisMap).filter_by(sheet_id=sheet_id).delete()
+
+    db.delete(sheet)
+    db.commit()
+    return True
